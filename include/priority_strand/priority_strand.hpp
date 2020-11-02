@@ -32,38 +32,7 @@
 
 namespace boost::asio {
 
-/// Prioritized handler
-/// Wrap the handler with this tag type in order for `PriorityStrand` to prioritize the
-/// handler
-template <class Function>
-struct Prioritized {
-    explicit Prioritized(Function&& f)
-            : f(std::move(f)) {
-    }
-
-    void operator()() {
-        f();
-    }
-
-    Function f;
-};
-
-template <class Function>
-Prioritized(Function &&)->Prioritized<Function>;
-
 namespace detail {
-
-template <class Function>
-struct IsPrioritizedImpl : std::false_type {};
-
-template <class Function>
-struct IsPrioritizedImpl<Prioritized<Function>> : std::true_type {};
-
-template <class Function>
-struct IsPrioritized;
-
-template <class Function>
-struct IsPrioritized<detail::work_dispatcher<Function>> : IsPrioritizedImpl<Function> {};
 
 class SpinLock {
 public:
@@ -137,7 +106,9 @@ public:
                 , shutdown(false)
                 , locked(false)
                 , total_in(0)
-                , total_out(0) {
+                , total_out(0)
+                , priority_total_in(0)
+                , priority_total_out(0) {
         }
 
         ~PriorityStrandImpl() noexcept {
@@ -158,31 +129,33 @@ public:
         bool locked;
         uint64_t total_in;
         uint64_t total_out;
+        uint64_t priority_total_in;
+        uint64_t priority_total_out;
         SpinLock mutex;
     };
 
     using ImplementationType = std::shared_ptr<PriorityStrandImpl>;
 
     template <typename Executor>
-    class invoker {
+    class Invoker {
     public:
-        invoker(ImplementationType const& impl, Executor& ex) noexcept
+        Invoker(ImplementationType const& impl, Executor& ex) noexcept
                 : impl(impl)
                 , work(ex) {
         }
 
-        invoker(invoker const& other) noexcept
+        Invoker(Invoker const& other) noexcept
                 : impl(other.impl)
                 , work(other.work) {
         }
 
-        invoker(invoker&& other) noexcept
+        Invoker(Invoker&& other) noexcept
                 : impl(std::move(other.impl))
                 , work(std::move(other.work)) {
         }
 
         struct on_invoker_exit {
-            invoker* this_;
+            Invoker* this_;
 
             ~on_invoker_exit() /*noexcept*/ {
                 this_->impl->mutex.lock();
@@ -214,6 +187,7 @@ public:
                 if (auto lock = std::unique_lock(impl->mutex);
                     auto const o = impl->priority_queue.front()) {
                     impl->priority_queue.pop();
+                    ++impl->priority_total_out;
                     lock.unlock();
                     o->complete(impl.get(), ec, 0);
                     ++work_count;
@@ -246,33 +220,97 @@ public:
     }
 
     template <typename Executor, typename Function, typename Allocator>
+    static void dispatch(ImplementationType const& impl,
+                         Executor& ex,
+                         Function&& function,
+                         Allocator const& a,
+                         bool prioritized) /*noexcept*/ {
+        using FunctionType = std::decay_t<Function>;
+
+        if (call_stack<PriorityStrandImpl>::contains(impl.get())) {
+            FunctionType tmp(std::forward<Function>(function));
+
+            fenced_block b(fenced_block::full);
+            boost_asio_handler_invoke_helpers::invoke(tmp, tmp);
+            return;
+        }
+
+        using Op = executor_op<FunctionType, Allocator>;
+        typename Op::ptr p = {std::addressof(a), Op::ptr::allocate(a), 0};
+        p.p = new (p.v) Op(std::forward<Function>(function), a);
+
+        BOOST_ASIO_HANDLER_CREATION((impl->service_->context(), *p.p, "PriorityStrand",
+                                     impl.get(), 0, "dispatch"));
+
+        bool first = enqueue(impl, p.p, prioritized);
+        p.v = p.p = 0;
+        if (first) { ex.dispatch(Invoker<Executor>(impl, ex), a); }
+    }
+
+    template <typename Executor, typename Function, typename Allocator>
     static void post(ImplementationType const& impl,
                      Executor& ex,
                      Function&& function,
-                     Allocator const& a) /*noexcept*/ {
+                     Allocator const& a,
+                     bool prioritized) /*noexcept*/ {
         using FunctionType = std::decay_t<Function>;
 
-        // Allocate and construct an operation to wrap the function.
         using Op = detail::executor_op<FunctionType, Allocator>;
         typename Op::ptr p = {std::addressof(a), Op::ptr::allocate(a), 0};
         p.p = new (p.v) Op(std::forward<Function>(function), a);
 
-        // Add the function to the strand and schedule the strand if required.
-        bool first = enqueue(impl, p.p, IsPrioritized<Function>::value);
+        BOOST_ASIO_HANDLER_CREATION((impl->service_->context(), *p.p, "PriorityStrand",
+                                     impl.get(), 0, "post"));
+
+        bool first = enqueue(impl, p.p, prioritized);
         p.v = p.p = 0;
-        if (first) { ex.post(invoker<Executor>(impl, ex), a); }
+        if (first) { ex.post(Invoker<Executor>(impl, ex), a); }
     }
 
-    static uint64_t total_normal_in(ImplementationType const& impl) noexcept {
+    template <typename Executor, typename Function, typename Allocator>
+    static void defer(ImplementationType const& impl,
+                      Executor& ex,
+                      Function&& function,
+                      Allocator const& a,
+                      bool prioritized) /*noexcept*/ {
+        using FunctionType = std::decay_t<Function>;
+
+        using Op = detail::executor_op<FunctionType, Allocator>;
+        typename Op::ptr p = {std::addressof(a), Op::ptr::allocate(a), 0};
+        p.p = new (p.v) Op(std::forward<Function>(function), a);
+
+        BOOST_ASIO_HANDLER_CREATION((impl->service_->context(), *p.p, "PriorityStrand",
+                                     impl.get(), 0, "defer"));
+
+        bool first = enqueue(impl, p.p, prioritized);
+        p.v = p.p = 0;
+        if (first) { ex.defer(Invoker<Executor>(impl, ex), a); }
+    }
+
+    static uint64_t normal_in(ImplementationType const& impl) noexcept {
         impl->mutex.lock();
         auto ret = impl->total_in;
         impl->mutex.unlock();
         return ret;
     }
 
-    static uint64_t total_normal_out(ImplementationType const& impl) noexcept {
+    static uint64_t normal_out(ImplementationType const& impl) noexcept {
         impl->mutex.lock();
         auto ret = impl->total_out;
+        impl->mutex.unlock();
+        return ret;
+    }
+
+    static uint64_t priority_in(ImplementationType const& impl) noexcept {
+        impl->mutex.lock();
+        auto ret = impl->priority_total_in;
+        impl->mutex.unlock();
+        return ret;
+    }
+
+    static uint64_t priority_out(ImplementationType const& impl) noexcept {
+        impl->mutex.lock();
+        auto ret = impl->priority_total_out;
         impl->mutex.unlock();
         return ret;
     }
@@ -288,6 +326,7 @@ public:
         } else if (impl->locked) {
             if (prioritized) {
                 impl->priority_queue.push(op);
+                ++impl->priority_total_in;
             } else {
                 impl->queue.push(op);
                 ++impl->total_in;
@@ -298,6 +337,7 @@ public:
             impl->locked = true;
             if (prioritized) {
                 impl->priority_queue.push(op);
+                ++impl->priority_total_in;
             } else {
                 impl->queue.push(op);
                 ++impl->total_in;
@@ -328,9 +368,20 @@ private:
 } // namespace detail
 
 /// Priority Strand
-/// Supports two priorities - normal and high. Handlers wrapped with `Prioritized` have
-/// high priority. A high priority task is executed as soon as the strand finishes its'
-/// current task.
+/// Adds two guaranties to the adapted _Executor_ type:
+/// 1. no tasks are executed simultaneously (works are executed sequentially);
+/// 2. all high priority tasks are executed first in the FIFO manner.
+///
+/// Example
+/// -------
+/// \code
+/// io_context io;
+/// PriorityStrand strand(io.get_executor());
+/// post(strand, [] { /*normal priority work*/ }));
+/// post(strand.high_priority(), [] { /*high priority work*/ }));
+/// \code
+///
+/// \remark All member functions are thread safe.
 template <typename Executor>
 class PriorityStrand {
 public:
@@ -358,28 +409,64 @@ public:
     }
 
     template <typename Function, typename Allocator>
-    void dispatch(Function&& f, Allocator const& a) const /*noexcept*/;
+    void dispatch(Function&& f, Allocator const& a) const /*noexcept*/ {
+        detail::PriorityStrandService::dispatch(impl, executor, std::forward<Function>(f),
+                                                a, prioritized_);
+    }
 
     template <typename Function, typename Allocator>
     void post(Function&& f, Allocator const& a) const /*noexcept*/ {
-        detail::PriorityStrandService::post(impl, executor, std::forward<Function>(f), a);
+        detail::PriorityStrandService::post(impl, executor, std::forward<Function>(f), a,
+                                            prioritized_);
     }
 
     template <typename Function, typename Allocator>
-    void defer(Function&& f, Allocator const& a) const /*noexcept*/;
-
-    uint64_t total_normal_in() const noexcept {
-        return detail::PriorityStrandService::total_normal_in(impl);
+    void defer(Function&& f, Allocator const& a) const /*noexcept*/ {
+        detail::PriorityStrandService::defer(impl, executor, std::forward<Function>(f), a,
+                                             prioritized_);
     }
 
-    uint64_t total_normal_out() const noexcept {
-        return detail::PriorityStrandService::total_normal_out(impl);
+    uint64_t normal_in() const noexcept {
+        return detail::PriorityStrandService::normal_in(impl);
+    }
+
+    uint64_t normal_out() const noexcept {
+        return detail::PriorityStrandService::normal_out(impl);
+    }
+
+    uint64_t priority_in() const noexcept {
+        return detail::PriorityStrandService::priority_in(impl);
+    }
+
+    uint64_t priority_out() const noexcept {
+        return detail::PriorityStrandService::priority_out(impl);
+    }
+
+    /// Copy and change the priority to high for the work about to come through the new
+    /// instance.
+    ///
+    /// \remark _Executor_ is a lightweight object, which is cheap to copy. Technically
+    /// it is just a copy of a pointer. See _Executor_ concept in _Boost.Asio_ for more
+    /// details.
+    PriorityStrand high_priority() const noexcept {
+        auto ret = *this;
+        ret.prioritized_ = true;
+        return ret;
+    }
+
+    /// Copy and change the priority to normal for the work about to come through the new
+    /// instance.
+    PriorityStrand normal_priority() const noexcept {
+        auto ret = *this;
+        ret.prioritized_ = false;
+        return ret;
     }
 
 private:
     Executor executor;
     using ImplementationType = detail::PriorityStrandService::ImplementationType;
     ImplementationType impl;
+    bool prioritized_{false};
 };
 
 } // namespace boost::asio

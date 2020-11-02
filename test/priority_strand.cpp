@@ -70,7 +70,7 @@ TEST_CASE("basic") {
         }
 
         for (size_t i = 100; i < 200; ++i) {
-            post(strand, Prioritized([&, i] { order.push_back(i); }));
+            defer(strand.high_priority(), [&, i] { order.push_back(i); });
         }
 
         std::thread workder1([&io] { io.run(); });
@@ -132,7 +132,7 @@ TEST_CASE("active priority push") {
         t3.join();
     });
 
-    post(strand, Prioritized([&done] { done = true; }));
+    post(strand.high_priority(), [&done] { done = true; });
 
     auto tmp1 = not_priority_executed.load();
     while (true) {
@@ -148,8 +148,25 @@ TEST_CASE("active priority push") {
     REQUIRE(done);
 
     join.scope_exit();
-    REQUIRE(strand.total_normal_in() == count_max);
-    REQUIRE(strand.total_normal_out() == count_max);
+    REQUIRE(strand.normal_in() == count_max);
+    REQUIRE(strand.normal_out() == count_max);
 
     timer.cancel();
+}
+
+TEST_CASE("timer") {
+    io_context io;
+    PriorityStrand<io_context::executor_type> strand(io.get_executor());
+
+    bool done{false};
+
+    steady_timer timer(io.get_executor(), seconds(0));
+    timer.async_wait(boost::asio::bind_executor(
+            strand.high_priority(), [&done](boost::system::error_code) { done = true; }));
+
+    io.run();
+
+    REQUIRE(strand.normal_in() == 0);
+    REQUIRE(strand.priority_in() == 1);
+    REQUIRE(strand.priority_out() == 1);
 }

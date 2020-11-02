@@ -80,8 +80,8 @@ void bm_priority_strand(benchmark::State& state) {
         for (size_t i = 0; i < 10; ++i) {
             post(io, [&async_count] { ++async_count; });
             post(strand, [&strand_count] { ++strand_count; });
-            post(strand,
-                 Prioritized([&priority_strand_count] { ++priority_strand_count; }));
+            post(strand.high_priority(),
+                 [&priority_strand_count] { ++priority_strand_count; });
         }
 
         while (async_count != 10 || strand_count != 10 || priority_strand_count != 10)
