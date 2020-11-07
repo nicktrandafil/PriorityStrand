@@ -29,6 +29,7 @@ RUN git clone --recurse-submodules https://github.com/catchorg/Catch2.git \
  && cmake --build . --target install
 
 # benchmark
+WORKDIR /tmp
 RUN git clone https://github.com/google/benchmark.git \
   && cd benchmark \
   && cmake -E make_directory "build" \
